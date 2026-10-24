@@ -1,3 +1,5 @@
 .env
 /gofari
 *.exe
+*.sum
+*.mod
