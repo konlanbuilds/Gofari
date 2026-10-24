@@ -4,6 +4,48 @@
 
 Gofari will be both a reusable Go core and a deployable API/worker service. It will accept generic JSON jobs, persist them in PostgreSQL, provide at-least-once delivery with lease recovery and retries, and expose a pluggable executor interface for future Python support.
 
+## Queue Domain Model
+
+Gofari distinguishes reusable work definitions from individual executions:
+
+- **Task**: a registered, reusable unit of work with a name, input contract, and
+  executor implementation.
+- **Workflow**: a named ordered composition of Tasks. Workflows are part of the
+  domain model now, but durable multi-step execution is deferred until the
+  single-task lifecycle is proven.
+- **Job**: a persisted request to execute one Task or Workflow. It contains the
+  target, generic versioned input, scheduling information, retry policy, and
+  lifecycle state.
+- **Executor registry**: an explicit in-process mapping from task names to Go
+  implementations. Task definitions are not dynamically loaded from PostgreSQL.
+
+The first implementation uses the existing generic `type` and `payload` idea as
+the task target and input. The model should evolve toward an explicit target kind
+(`task` or `workflow`) and target name without requiring every workflow capability
+in the first working version.
+
+### Queue decisions
+
+- Use one default queue first. Named queues and priority routing are later
+  extensions, not initial requirements.
+- Support one-time scheduling with `run_at`. Recurring schedules are out of
+  scope for the first release.
+- Use polling as the baseline delivery mechanism. PostgreSQL notifications may
+  reduce idle latency later, but they are not the durable delivery mechanism.
+- Cancel cooperatively: queued jobs should not start after cancellation, and
+  running executors should observe context cancellation. The system will not
+  attempt unsafe forced termination.
+- Keep completed, failed, and cancelled jobs according to configurable retention
+  and cleanup policy.
+
+### Workflow scope
+
+The first workflow-capable design records workflow intent but implements the
+single-task path first. Later workflow execution will run ordered tasks and stop
+at the failed step, retrying the Job according to its policy. Durable per-step
+resume, compensation tasks, and continuing after a failed step are deferred until
+the basic lifecycle is stable.
+
 ## Requirements
 
 ### Functional
@@ -11,15 +53,20 @@ Gofari will be both a reusable Go core and a deployable API/worker service. It w
 - Accept generic JSON jobs through an HTTP API.
 - Persist jobs durably in PostgreSQL.
 - Support job types, payload versions, scheduled execution, and idempotency keys.
+- Represent both Task and Workflow targets while implementing single-task
+  execution first.
 - Atomically claim jobs across multiple workers.
 - Track attempts, leases, failures, and execution timestamps.
 - Retry transient failures with exponential backoff and jitter.
 - Mark permanent failures and exhausted retries as terminal.
+- Keep retry-exhausted jobs as terminal failed records; defer a separate
+  dead-letter queue/table and replay tooling.
 - Recover jobs from crashed workers after lease expiry.
 - Support inspection, cancellation, and manual retry.
 - Provide an executor interface for Python, HTTP, or subprocess adapters later.
 - Provide liveness, readiness, and metrics endpoints.
 - Support graceful worker shutdown.
+- Retain terminal jobs for configurable inspection and cleanup.
 
 ### Non-functional
 
@@ -329,7 +376,8 @@ Acceptance: CI reproduces the documented local verification commands.
 | Column | Type | Purpose |
 |---|---|---|
 | `id` | `uuid` | Stable job identifier |
-| `type` | `text` | Executor/job type |
+| `target_kind` | `text` | `task` or `workflow`; single-task execution comes first |
+| `target_name` | `text` | Registered task or workflow name |
 | `payload` | `jsonb` | Generic job input |
 | `payload_version` | `integer` | Payload compatibility version |
 | `status` | `text` | `queued`, `running`, `succeeded`, `failed`, `cancelled` |
@@ -347,12 +395,16 @@ Acceptance: CI reproduces the documented local verification commands.
 | `finished_at` | `timestamptz` | Terminal completion time |
 | `updated_at` | `timestamptz` | Last state change |
 
+For the learning-first in-memory version, `type` may remain a single field. The
+PostgreSQL model should use `target_kind` and `target_name` once workflows are
+represented explicitly.
+
 Recommended constraints:
 
 - `attempts >= 0`
 - `max_attempts > 0`
 - Valid status values
-- Unique `(type, idempotency_key)` when the key is present
+- Unique `(target_kind, target_name, idempotency_key)` when the key is present
 
 Recommended indexes:
 
@@ -406,7 +458,7 @@ Worker updates must include both the job ID and lease token so a late worker can
 | Worker finishes after lease expiry | Lease token rejects stale updates |
 | Retryable executor error | Increment attempt and schedule a future retry |
 | Permanent executor error | Mark job failed immediately |
-| Retry limit reached | Mark terminal failed/dead-letter state |
+| Retry limit reached | Mark terminal failed state; defer dead-letter storage and replay |
 | Malformed payload | Permanent failure; do not retry indefinitely |
 | Unknown job type | Permanent failure until an adapter is available |
 | Worker panic | Recover panic and apply retry policy |
@@ -446,7 +498,7 @@ Worker updates must include both the job ID and lease token so a late worker can
 - Large JSON payloads increase storage and contention. Enforce limits and later support object-storage references.
 - External executors can become code-execution vulnerabilities. Isolate them, authenticate submissions, and apply resource limits.
 - No initial authentication is safe only for trusted development. Add authentication before internet exposure.
-- Terminal jobs can grow without bound. Add configurable retention and cleanup before production use.
+- Terminal jobs can grow without bound. Add configurable retention and cleanup before production use; add dead-letter replay later.
 - Job IDs must not become metric labels. Keep IDs in logs/traces and use bounded labels in metrics.
 
 ## Verification
@@ -468,4 +520,25 @@ Worker updates must include both the job ID and lease token so a late worker can
 - Authentication: omitted initially for trusted development; required before production exposure.
 - Migrations: explicit, not automatic at service startup.
 - Observability: structured logs, metrics, and configurable OpenTelemetry tracing.
+- Queue model: one default queue first; named queues and priority routing are deferred.
+- Scheduling: one-time `run_at` scheduling first; recurring schedules are deferred.
+- Domain model: Tasks and Workflows are explicit concepts, but single-task execution is implemented first.
+- Workflow behavior: later workflows execute ordered steps and stop/retry at the failed step; durable step resume and compensation are deferred.
+- Cancellation: cooperative cancellation through context propagation.
+- Retention: configurable cleanup for terminal jobs.
+- Dead letters: terminal failed records first; separate dead-letter storage and replay tooling later.
 - Out of scope for the first release: exactly-once effects, distributed scheduling, authentication implementation, and Python execution itself.
+
+## Reference Material
+
+- [Payload Jobs and Queues](https://payloadcms.com/docs/jobs-queue/jobs) informed
+  the Task/Workflow/Job distinction, scheduling, queue selection, cancellation,
+  and job inspection concepts.
+- [Task Queues - System Design](https://www.geeksforgeeks.org/system-design/task-queues-system-design/)
+  informed the producer, durable queue, worker, acknowledgment, and retry model.
+- [Dead Letter Queue - System Design](https://www.geeksforgeeks.org/system-design/dead-letter-queue-system-design/)
+  informed the decision to make retry exhaustion observable and to defer
+  dedicated dead-letter storage and replay tooling.
+- [Queues and Task Scheduling](https://medium.com/@bit_by_bit/queues-and-task-scheduling-80917ce58edb)
+  was supplied as design reference; it was not directly fetched because the site
+  returned HTTP 403 during review.
