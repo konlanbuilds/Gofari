@@ -1,5 +1,8 @@
 .env
 /gofari
 *.exe
-*.sum
-*.mod
+
+# Local learning toolkit (not part of the project)
+/AGENTS.md
+/.opencode/
+/learning/
