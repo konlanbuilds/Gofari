@@ -22,6 +22,41 @@ func New() *Store {
 	}
 }
 
+func (s *Store) Get(ctx context.Context, id uuid.UUID) (jobs.Job, error) {
+	if err := ctx.Err(); err != nil {
+		return jobs.Job{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[id]
+	if !ok {
+		return jobs.Job{}, errors.New("job not found")
+	}
+	return job, nil
+}
+
+func (s *Store) List(ctx context.Context, status jobs.Status, limit int) ([]jobs.Job, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 {
+		limit = 100
+	}
+	result := make([]jobs.Job, 0, limit)
+	for _, job := range s.jobs {
+		if status != "" && job.Status != status {
+			continue
+		}
+		result = append(result, job)
+		if len(result) == limit {
+			break
+		}
+	}
+	return result, nil
+}
+
 func (s *Store) Enqueue(ctx context.Context, job jobs.Job) (jobs.Job, error) {
 	if ctx.Err() != nil {
 		return jobs.Job{}, ctx.Err()

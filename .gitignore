@@ -1,6 +1,7 @@
 .env
 /gofari
 *.exe
+/docs/
 
 # Local learning toolkit (not part of the project)
 /AGENTS.md

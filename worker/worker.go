@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/konlanbuilds/Gofari/executor"
@@ -39,25 +40,21 @@ func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
 	}
 
 	if job.TargetKind == jobs.TargetWorkflow {
-		_ = w.Store.AcknowledgeFailure(ctx, job.ID, job.LeaseToken, "workflow not supported in v1", nil)
-		return true, nil
+		return true, w.Store.AcknowledgeFailure(ctx, job.ID, job.LeaseToken, "workflow not supported in v1", nil)
 	}
 
 	if w.Registry == nil {
-		_ = w.Store.AcknowledgeFailure(ctx, job.ID, job.LeaseToken, "no executor registry", nil)
-		return true, nil
+		return true, w.Store.AcknowledgeFailure(ctx, job.ID, job.LeaseToken, "no executor registry", nil)
 	}
 
 	exec, ok := w.Registry.Resolve(job.TargetName)
 	if !ok {
-		_ = w.Store.AcknowledgeFailure(ctx, job.ID, job.LeaseToken, "unknown task: "+job.TargetName, nil)
-		return true, nil
+		return true, w.Store.AcknowledgeFailure(ctx, job.ID, job.LeaseToken, "unknown task: "+job.TargetName, nil)
 	}
 
 	res, execErr := exec.Execute(ctx, *job)
 	if execErr != nil {
-		_ = w.Store.AcknowledgeFailure(ctx, job.ID, job.LeaseToken, execErr.Error(), nil)
-		return true, nil
+		return true, w.Store.AcknowledgeFailure(ctx, job.ID, job.LeaseToken, execErr.Error(), nil)
 	}
 
 	if res == nil {
@@ -67,4 +64,23 @@ func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
 		return true, err
 	}
 	return true, nil
+}
+
+func (w *Worker) Run(ctx context.Context, pollInterval time.Duration) error {
+	if pollInterval <= 0 {
+		return errors.New("poll interval must be positive")
+	}
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if _, err := w.ProcessOne(ctx); err != nil {
+				return err
+			}
+		}
+	}
 }
